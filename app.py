@@ -35,3 +35,4 @@ if user_text:
                 st.session_state.memory
             )
             st.write(reply)
+    print(st.session_state.memory)
