@@ -2,6 +2,7 @@ import streamlit as st
 
 from main import process_user_message
 from memory.short_term import init_memory
+from stt.whisper_service import transcribe_audio
 
 
 st.set_page_config(
@@ -22,7 +23,25 @@ for message in st.session_state.memory:
     with st.chat_message(message["role"]):
         st.write(message["content"])
 
-user_text = st.chat_input("Ask Jarvis something...")
+
+user_text = None
+
+with st.sidebar:
+    st.header("🎤 Voice")
+    audio_input = st.audio_input("Speak to Jarvis")
+
+    if audio_input:
+        with st.spinner("Recognizing your voice..."):
+            user_text = transcribe_audio(audio_input.read())
+
+        st.success(f"You said: {user_text}")
+
+
+text_input = st.chat_input("Ask Jarvis something...")
+
+if text_input:
+    user_text = text_input
+
 
 if user_text:
     with st.chat_message("user"):
@@ -35,4 +54,3 @@ if user_text:
                 st.session_state.memory
             )
             st.write(reply)
-    print(st.session_state.memory)
