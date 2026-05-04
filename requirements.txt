@@ -1,4 +1,6 @@
-streamlit
+pydantic
+fastapi
+requests
 ollama
 openai-whisper
 ffmpeg-python
