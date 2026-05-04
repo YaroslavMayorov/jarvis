@@ -2,6 +2,8 @@ import { useRef, useState } from "react";
 import "./App.css";
 import ReactMarkdown from "react-markdown";
 
+const API_URL = "http://localhost:8000";
+
 export default function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
@@ -13,6 +15,8 @@ export default function App() {
   const [enableVoice, setEnableVoice] = useState(false);
   const [voiceMode, setVoiceMode] = useState("default");
   const [voiceFile, setVoiceFile] = useState(null);
+  const [customVoiceId, setCustomVoiceId] = useState(null);
+  const [isUploadingVoice, setIsUploadingVoice] = useState(false);
 
   const [enableVideo, setEnableVideo] = useState(false);
   const [avatarMode, setAvatarMode] = useState("default");
@@ -22,44 +26,95 @@ export default function App() {
   const mediaRecorderRef = useRef(null);
   const chunksRef = useRef([]);
 
-  async function generateTTSUrl(text) {
-    if (!enableVoice) return null;
+  async function uploadCustomVoice(file) {
+    if (!file) return null;
+
+    setIsUploadingVoice(true);
 
     const formData = new FormData();
-    formData.append("text", text);
+    formData.append("file", file);
 
-    let response;
+    const response = await fetch(`${API_URL}/upload-voice`, {
+      method: "POST",
+      body: formData,
+    });
 
-    if (voiceMode === "default") {
-      response = await fetch("http://localhost:8000/speak-default", {
-        method: "POST",
-        body: formData,
-      });
-    } else if (voiceMode === "custom" && voiceFile) {
-      formData.append("voice_file", voiceFile);
-
-      response = await fetch("http://localhost:8000/speak-clone", {
-        method: "POST",
-        body: formData,
-      });
-    } else {
-      return null;
-    }
+    setIsUploadingVoice(false);
 
     if (!response.ok) {
-      console.error("TTS failed:", await response.text());
+      console.error("Voice upload failed:", await response.text());
       return null;
     }
 
-    const blob = await response.blob();
+    const data = await response.json();
 
-    if (blob.size === 0) {
-      console.error("TTS returned empty audio file");
+    if (!data.voice_id) {
+      console.error("No voice_id returned:", data);
       return null;
     }
 
-    return URL.createObjectURL(blob);
+    setCustomVoiceId(data.voice_id);
+    return data.voice_id;
   }
+
+  async function generateTTSUrl(text) {
+      if (!enableVoice) return null;
+
+      const formData = new FormData();
+      formData.append("text", text);
+
+      let response;
+
+      if (voiceMode === "default") {
+        response = await fetch(`${API_URL}/speak-default`, {
+          method: "POST",
+          body: formData,
+        });
+      } else if (voiceMode === "custom") {
+        let voiceId = customVoiceId;
+
+        if (!voiceId) {
+          if (!voiceFile) {
+            console.error("No custom voice file selected");
+            return null;
+          }
+
+          voiceId = await uploadCustomVoice(voiceFile);
+
+          if (!voiceId) {
+            console.error("Failed to upload custom voice");
+            return null;
+          }
+        }
+
+        formData.append("voice_id", voiceId);
+
+        response = await fetch(`${API_URL}/speak-clone`, {
+          method: "POST",
+          body: formData,
+        });
+      } else {
+        return null;
+      }
+
+      if (!response.ok) {
+        console.error("TTS failed:", await response.text());
+        return null;
+      }
+
+      const data = await response.json();
+
+      if (!data.audio_url) {
+        console.error("No audio_url in TTS response:", data);
+        return null;
+      }
+
+      if (data.voice_id) {
+        setCustomVoiceId(data.voice_id);
+      }
+
+      return data.audio_url;
+    }
 
   async function addAssistantMessageWithVoice(reply) {
     const assistantMessageId = Date.now() + Math.random();
@@ -95,11 +150,19 @@ export default function App() {
   async function sendText(text) {
     if (!text.trim()) return;
 
-    setMessages((prev) => [...prev, { role: "user", content: text }]);
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: Date.now() + Math.random(),
+        role: "user",
+        content: text,
+      },
+    ]);
+
     setInput("");
     setIsThinking(true);
 
-    const response = await fetch("http://localhost:8000/chat", {
+    const response = await fetch(`${API_URL}/chat`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -132,7 +195,7 @@ export default function App() {
 
       setIsThinking(true);
 
-      const response = await fetch("http://localhost:8000/voice", {
+      const response = await fetch(`${API_URL}/voice`, {
         method: "POST",
         body: formData,
       });
@@ -141,12 +204,18 @@ export default function App() {
 
       setMessages((prev) => [
         ...prev,
-        { role: "user", content: data.transcript },
+        {
+          id: Date.now() + Math.random(),
+          role: "user",
+          content: data.transcript,
+        },
       ]);
 
       setRecordingSeconds(0);
 
       await addAssistantMessageWithVoice(data.reply);
+
+      stream.getTracks().forEach((track) => track.stop());
     };
 
     mediaRecorder.start();
@@ -220,11 +289,19 @@ export default function App() {
               </div>
 
               {voiceMode === "custom" && (
-                <input
-                  type="file"
-                  accept=".wav,.mp3,.m4a,.mp4,.mov,.webm,audio/*,video/*"
-                  onChange={(e) => setVoiceFile(e.target.files[0])}
-                />
+                <>
+                  <input
+                    type="file"
+                    accept=".wav,.mp3,.m4a,.mp4,.mov,.webm,audio/*,video/*"
+                    onChange={(e) => {
+                      setVoiceFile(e.target.files[0]);
+                      setCustomVoiceId(null);
+                    }}
+                  />
+
+                  {isUploadingVoice && <p>Uploading custom voice...</p>}
+                  {customVoiceId && <p>Custom voice is ready ✅</p>}
+                </>
               )}
             </div>
           )}
