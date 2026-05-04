@@ -1,14 +1,16 @@
 import os
 import subprocess
+import traceback
 import uuid
-import shutil
 from pathlib import Path
+from fastapi.staticfiles import StaticFiles
 
 import requests
 from dotenv import load_dotenv
-from fastapi import UploadFile, File, Form, FastAPI, HTTPException, Body
+from fastapi import UploadFile, File, Form, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from main import process_user_message
@@ -24,6 +26,7 @@ if not ELEVENLABS_API_KEY:
 
 app = FastAPI()
 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
@@ -36,9 +39,13 @@ BASE_DIR = Path(__file__).parent
 UPLOADS_DIR = BASE_DIR / "uploads"
 VOICES_DIR = UPLOADS_DIR / "voices"
 AVATARS_DIR = UPLOADS_DIR / "avatars"
+TTS_DIR = UPLOADS_DIR / "tts"
 
 VOICES_DIR.mkdir(parents=True, exist_ok=True)
 AVATARS_DIR.mkdir(parents=True, exist_ok=True)
+TTS_DIR.mkdir(parents=True, exist_ok=True)
+# Serve uploaded files (voices, avatars, tts) as static
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
 memory = init_memory()
 
@@ -47,35 +54,12 @@ class ChatRequest(BaseModel):
     message: str
 
 
-class SpeakCloneRequest(BaseModel):
-    text: str
-    voice_id: str
-
-
-class ElevenLabsAPIError(RuntimeError):
-    """Represents an error response returned by ElevenLabs API.
-
-    Carries the upstream HTTP status code and the response text to allow
-    the endpoint to map it to an appropriate client-facing status.
-    """
-
-    def __init__(self, status_code: int, message: str):
-        super().__init__(message)
-        self.status_code = status_code
-
-
 def speak_default(text: str) -> None:
     subprocess.run(["say", "-v", "Samantha", text], check=True)
 
 
 def convert_audio_to_wav(input_path: Path) -> Path:
     output_path = input_path.with_suffix(".wav")
-
-    # Validate ffmpeg availability early to provide a clear error
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError(
-            "ffmpeg is not installed or not found in PATH. Please install ffmpeg and try again."
-        )
 
     command = [
         "ffmpeg",
@@ -98,15 +82,56 @@ def convert_audio_to_wav(input_path: Path) -> Path:
             stderr=subprocess.PIPE,
             text=True,
         )
-    except FileNotFoundError:
-        # Edge case: ffmpeg disappeared between the earlier check and now
-        raise RuntimeError(
-            "ffmpeg binary not found at runtime. Ensure ffmpeg is installed and accessible in PATH."
-        )
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"ffmpeg failed: {e.stderr}")
 
     return output_path
+
+
+def _save_tts_bytes(audio_bytes: bytes, ext: str = ".mp3") -> Path:
+    file_id = f"{uuid.uuid4()}{ext}"
+    out_path = TTS_DIR / file_id
+    out_path.write_bytes(audio_bytes)
+    return out_path
+
+
+def _say_tts_to_mp3(text: str) -> Path:
+    """Use macOS 'say' to synthesize speech and convert to mp3, then save under TTS_DIR.
+
+    Falls back to raising RuntimeError if any step fails.
+    """
+    tmp_aiff = TTS_DIR / f"{uuid.uuid4()}.aiff"
+    out_mp3 = TTS_DIR / f"{uuid.uuid4()}.mp3"
+
+    try:
+        # Generate AIFF using system voice
+        subprocess.run(["say", "-v", "Samantha", "-o", str(tmp_aiff), text], check=True)
+
+        # Convert to MP3 via ffmpeg
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(tmp_aiff),
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            "-b:a",
+            "128k",
+            str(out_mp3),
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"TTS generation failed: {e.stderr}")
+    finally:
+        try:
+            if tmp_aiff.exists():
+                tmp_aiff.unlink()
+        except Exception:
+            pass
+
+    return out_mp3
 
 
 def create_custom_voice(name: str, audio_file_path: str) -> str:
@@ -116,31 +141,26 @@ def create_custom_voice(name: str, audio_file_path: str) -> str:
         "xi-api-key": ELEVENLABS_API_KEY,
     }
 
-    try:
-        with open(audio_file_path, "rb") as audio:
-            files = [
-                ("files", (Path(audio_file_path).name, audio, "audio/wav")),
-            ]
+    with open(audio_file_path, "rb") as audio:
+        files = [
+            ("files", (Path(audio_file_path).name, audio, "audio/wav")),
+        ]
 
-            data = {
-                "name": name,
-                "description": "Custom cloned voice for assistant project",
-            }
+        data = {
+            "name": name,
+            "description": "Custom cloned voice for assistant project",
+        }
 
-            response = requests.post(
-                url,
-                headers=headers,
-                files=files,
-                data=data,
-                timeout=60,
-            )
-    except requests.RequestException as e:
-        # Network/connection error to upstream
-        raise RuntimeError(f"ElevenLabs voice clone request failed: {e}")
+        response = requests.post(
+            url,
+            headers=headers,
+            files=files,
+            data=data,
+            timeout=60,
+        )
 
     if response.status_code >= 400:
-        # Bubble up upstream error with its status for proper mapping
-        raise ElevenLabsAPIError(response.status_code, response.text)
+        raise RuntimeError(f"ElevenLabs voice clone error: {response.text}")
 
     return response.json()["voice_id"]
 
@@ -165,20 +185,15 @@ def clone_voice_api(text: str, voice_id: str) -> bytes:
         },
     }
 
-    try:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=60,
-        )
-    except requests.RequestException as e:
-        # Network/connection error to upstream
-        raise RuntimeError(f"ElevenLabs TTS request failed: {e}")
+    response = requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=60,
+    )
 
     if response.status_code >= 400:
-        # Bubble up upstream error with its status for proper mapping
-        raise ElevenLabsAPIError(response.status_code, response.text)
+        raise RuntimeError(f"ElevenLabs TTS error: {response.text}")
 
     return response.content
 
@@ -204,27 +219,35 @@ async def voice(file: UploadFile = File(...)):
 @app.post("/upload-voice")
 async def upload_voice_endpoint(file: UploadFile = File(...)):
     try:
-        original_suffix = Path(file.filename or "voice").suffix or ".audio"
-        original_file_id = f"{uuid.uuid4()}{original_suffix}"
-        original_path = VOICES_DIR / original_file_id
+        filename = file.filename or "voice.wav"
 
-        original_path.write_bytes(await file.read())
+        wav_path = VOICES_DIR / filename
 
-        wav_path = convert_audio_to_wav(original_path)
+        # если уже есть → НЕ создаём новый voice
+        if wav_path.exists():
+            voice_id = wav_path.with_suffix(".id").read_text()
+            print("✅ reused voice_id:", voice_id)
+            return {"voice_id": voice_id}
 
-        elevenlabs_voice_id = create_custom_voice(
-            name=f"Custom voice {uuid.uuid4()}",
+        # сохраняем файл
+        wav_path.write_bytes(await file.read())
+
+        # конвертируем (перезапишет)
+        wav_path = convert_audio_to_wav(wav_path)
+
+        # создаём voice
+        voice_id = create_custom_voice(
+            name=filename,
             audio_file_path=str(wav_path),
         )
 
-        return {
-            "voice_id": elevenlabs_voice_id,
-            "local_original_file_id": original_file_id,
-            "local_wav_file": wav_path.name,
-            "voice_path": str(wav_path),
-        }
+        # сохраняем voice_id рядом
+        (wav_path.with_suffix(".id")).write_text(voice_id)
+
+        return {"voice_id": voice_id}
 
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -243,72 +266,40 @@ async def upload_avatar_endpoint(file: UploadFile = File(...)):
 
 
 @app.post("/speak-default")
-def speak_default_endpoint(text: str = Form(...)):
-    speak_default(text)
-    return {"status": "ok"}
+def speak_default_endpoint(request: Request, text: str = Form(...)):
+    # Generate and save mp3 locally, return a persistent URL
+    out_mp3 = _say_tts_to_mp3(text)
+
+    base_url = str(request.base_url).rstrip("/")
+    audio_rel = f"/uploads/tts/{out_mp3.name}"
+    audio_url = f"{base_url}{audio_rel}"
+
+    return {
+        "audio_url": audio_url,
+        "file": out_mp3.name,
+        "path": str(out_mp3),
+    }
 
 
 @app.post("/speak-clone")
 async def speak_clone_endpoint(
-    # Accept either multipart/form-data (Form) or JSON (Body)
-    text: str | None = Form(None),
-    voice_id: str | None = Form(None),
-    payload: SpeakCloneRequest | None = Body(None),
-    voice_file: UploadFile | None = File(None),
+    request: Request,
+    text: str = Form(...),
+    voice_id: str = Form(...),
 ):
     try:
-        # Prefer JSON payload if provided
-        if payload is not None:
-            text = payload.text
-            voice_id = payload.voice_id
-
-        # If a raw voice file is provided, create a temporary custom voice first
-        if voice_file is not None and voice_id is None:
-            # Save uploaded file
-            original_suffix = Path(voice_file.filename or "voice").suffix or ".audio"
-            original_file_id = f"{uuid.uuid4()}{original_suffix}"
-            original_path = VOICES_DIR / original_file_id
-            original_path.write_bytes(await voice_file.read())
-
-            # Convert to wav and create voice on ElevenLabs
-            wav_path = convert_audio_to_wav(original_path)
-            voice_id = create_custom_voice(
-                name=f"Custom voice {uuid.uuid4()}",
-                audio_file_path=str(wav_path),
-            )
-
-        # Validate inputs regardless of the source
-        if not text:
-            raise HTTPException(status_code=400, detail="Missing required field: 'text'.")
-
-        if not voice_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Provide either 'voice_id' (form or JSON) or 'voice_file' (multipart/form-data).",
-            )
-
         audio_bytes = clone_voice_api(text, voice_id)
 
-        return Response(
-            content=audio_bytes,
-            media_type="audio/mpeg",
-        )
-    except ElevenLabsAPIError as e:
-        # Map upstream ElevenLabs errors: 4xx -> 400 (client input/quota), 5xx -> 502
-        status = getattr(e, "status_code", 500)
-        detail = str(e)
-        if 400 <= status <= 499:
-            raise HTTPException(status_code=400, detail=detail)
-        # Treat 5xx as upstream failure
-        raise HTTPException(status_code=502, detail=detail)
-    except RuntimeError as e:
-        # Classify known runtime errors for clearer client feedback
-        msg = str(e)
-        if "ffmpeg" in msg.lower():
-            # Conversion failure or missing dependency
-            raise HTTPException(status_code=424, detail=msg)
-        # Likely upstream ElevenLabs error surfaced from helper functions
-        raise HTTPException(status_code=502, detail=msg)
+        saved_path = _save_tts_bytes(audio_bytes, ext=".mp3")
+        base_url = str(request.base_url).rstrip("/")
+        audio_url = f"{base_url}/uploads/tts/{saved_path.name}"
+
+        return {
+            "audio_url": audio_url,
+            "file": saved_path.name,
+            "path": str(saved_path),
+            "voice_id": voice_id,
+        }
+
     except Exception as e:
-        # Unexpected error
         raise HTTPException(status_code=500, detail=str(e))
